@@ -14,8 +14,8 @@ load_dotenv()
 client = anthropic.Anthropic()  # uses ANTHROPIC_API_KEY env var
 MODEL = "claude-sonnet-4-20250514"
 
-endpoint = "https://webtest.test.perma-plate.com"
-# endpoint = "https://warranties.permaplate.com"
+# endpoint = "https://webtest.test.perma-plate.com"
+endpoint = "https://warranties.permaplate.com"
 url = endpoint + "/api/ppapi.asmx"
 
 def getContractPDF(contract: str) -> Optional[str]:
