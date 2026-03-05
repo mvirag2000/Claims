@@ -5,6 +5,8 @@ from typing import Optional
 import requests
 import xml.etree.ElementTree as ET
 import os
+import base64
+import tempfile
 from requests.exceptions import HTTPError, Timeout
 from dotenv import load_dotenv
 import anthropic
@@ -12,7 +14,7 @@ import anthropic
 load_dotenv()
 
 client = anthropic.Anthropic()  # uses ANTHROPIC_API_KEY env var
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-sonnet-4-6"
 
 # endpoint = "https://webtest.test.perma-plate.com"
 endpoint = "https://warranties.permaplate.com"
@@ -60,8 +62,14 @@ def getContractPDF(contract: str) -> Optional[str]:
 def main():
     contract = input("Enter contract number: ")
     while contract != "":
+        pdf_tempfile = None
         base64_pdf = getContractPDF(contract)
         if base64_pdf is not None:
+            pdf_tempfile = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            pdf_tempfile.write(base64.b64decode(base64_pdf))
+            pdf_tempfile.close()
+            os.startfile(pdf_tempfile.name)
+
             messages = [
                 {
                     "role": "user",
@@ -76,7 +84,7 @@ def main():
                         },
                         {
                             "type": "text",
-                            "text": "This is a vehicle service agreement. I'm going to ask you questions about it.",
+                            "text": "This is a vehicle service agreement. You are a customer service agent working for the contract administrator. Answer questions from that perspective — never suggest contacting the administrator, as that's us.",
                         },
                     ],
                 }
@@ -103,6 +111,12 @@ def main():
                 query_text = input("Enter query: ")
         else:
             print(f"Contract {contract} not found.")
+
+        if pdf_tempfile is not None:
+            try:
+                os.unlink(pdf_tempfile.name)
+            except OSError:
+                pass  # viewer may still have it open
 
         print(f"Exiting contract {contract}")
         contract = input("\nEnter another contract number: ")

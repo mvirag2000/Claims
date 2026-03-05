@@ -11,11 +11,11 @@ import anthropic
 load_dotenv()
 
 client = anthropic.Anthropic()  # uses ANTHROPIC_API_KEY env var
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-sonnet-4-6"
 
 CASE_FIELDS = [
     # Claim overview
-    "CaseNumber", "Status", "Sub_Status__c", "Type", "Priority", "Origin",
+    "CaseNumber", "Status", "Type", "Priority", "Origin",
     "Claim_Determination__c", "Resolution__c", "Who_Filed_Claim__c",
     "Denial_Reason__c", "Denial_Reason_Text__c", "Claim_Number__c",
     "Confirmation_Num__c", "Claim_Score__c", "Original_Owner_Toggle__c",
@@ -26,23 +26,19 @@ CASE_FIELDS = [
     "Vehicle_Year__c", "Vehicle_Make__c", "Vehicle_Model__c",
     # Product & damage
     "Product__c", "Product_Group__c", "Product_Type__c",
-    "Damage_Type__c", "Location__c", "Side_of_Vehicle__c", "Vehicle_Row__c",
+    "Damage_Type__c", "Location__c", "Side_of_Vehicle__c",
     # Warranty
     "Warranty_Status__c", "Warranty_Account_Name__c", "Warranty_Group_Code__c",
     # Timeline
     "Date_of_Loss__c", "Claim_Date__c", "CreatedDate", "ClosedDate",
     "Days_from_loss_to_claim__c", "Age__c",
-    # Financials - estimated
-    "Estimated_Cost__c", "EST_Parts_Cost__c", "EST_Labor_Cost__c",
-    "EST_Labor_Amount__c", "EST_Tax_Cost__c", "EST_Total_Cost__c",
-    # Financials - actual
-    "ACT_Parts_Cost__c", "ACT_Labor_Cost__c", "ACT_Labor_Amount__c",
-    "ACT_Tax_Cost__c", "ACT_Total_Cost__c",
-    # Financials - amounts
-    "Approved_Amount__c", "Permaplate_Amount__c", "Dealer_Amount__c",
-    "Sales_Amount__c", "Invoice_Total__c", "Actual_Invoice_Amount__c",
+    # Financials
+    "Estimated_Cost__c", "EST_Total_Cost__c", "ACT_Total_Cost__c",
+    "Actual_Invoice_Amount__c",
     # Related names (parent relationship queries)
     "Account.Name", "Contact.Name", "Contact.Email", "Contact.Phone",
+    # Service Contract (via custom Warranty__c lookup)
+    "Warranty__c", "Warranty__r.ContractNumber",
 ]
 
 CASE_QUERY = (
@@ -150,17 +146,7 @@ def _check_completeness(case):
     if not case.get("Attempt_to_Rectify__c"):
         flags.append("No Attempt to Rectify")
 
-    # EST breakdown
-    est_fields = ["EST_Parts_Cost__c", "EST_Labor_Cost__c", "EST_Tax_Cost__c"]
-    if all(case.get(f) is None for f in est_fields):
-        flags.append("No EST cost breakdown")
-
-    # ACT breakdown
-    act_fields = ["ACT_Parts_Cost__c", "ACT_Labor_Cost__c", "ACT_Tax_Cost__c"]
-    if all(case.get(f) is None for f in act_fields):
-        flags.append("No ACT cost breakdown")
-
-    if case.get("Invoice_Total__c") is None and case.get("Actual_Invoice_Amount__c") is None:
+    if case.get("Actual_Invoice_Amount__c") is None:
         flags.append("No invoice amount")
 
     comments = _get_comments(case)
@@ -217,131 +203,110 @@ def generate_report(case):
     def out(text=""):
         lines.append(text)
 
-    out("=" * 70)
-    out(f"  CASE QUALITY REPORT -- {case_number}")
-    out("=" * 70)
+    out(f"# Case Quality Report — {case_number}")
 
     # Claim Overview
-    out("\n-- Claim Overview --")
-    out(f"  Case Number:   {_val(case, 'CaseNumber')}")
-    out(f"  Status:        {_val(case, 'Status')}")
-    out(f"  Sub-Status:    {_val(case, 'Sub_Status__c')}")
-    out(f"  Determination: {_val(case, 'Claim_Determination__c')}")
-    out(f"  Resolution:    {_val(case, 'Resolution__c')}")
-    out(f"  Priority:      {_val(case, 'Priority')}")
-    out(f"  Origin:        {_val(case, 'Origin')}")
-    out(f"  Who Filed:     {_val(case, 'Who_Filed_Claim__c')}")
-    out(f"  Claim Score:   {_val(case, 'Claim_Score__c')}")
+    out("\n## Claim Overview")
+    out(f"- **Case Number:** {_val(case, 'CaseNumber')}")
+    out(f"- **Status:** {_val(case, 'Status')}")
+    out(f"- **Determination:** {_val(case, 'Claim_Determination__c')}")
+    out(f"- **Resolution:** {_val(case, 'Resolution__c')}")
+    out(f"- **Priority:** {_val(case, 'Priority')}")
+    out(f"- **Origin:** {_val(case, 'Origin')}")
+    out(f"- **Who Filed:** {_val(case, 'Who_Filed_Claim__c')}")
+    out(f"- **Claim Score:** {_val(case, 'Claim_Score__c')}")
     if case.get("Denial_Reason__c"):
-        out(f"  Denial Reason: {case['Denial_Reason__c']}")
+        out(f"- **Denial Reason:** {case['Denial_Reason__c']}")
         if case.get("Denial_Reason_Text__c"):
-            out(f"  Denial Detail: {case['Denial_Reason_Text__c']}")
+            out(f"- **Denial Detail:** {case['Denial_Reason_Text__c']}")
 
     # Contact
     contact = case.get("Contact")
     if contact:
-        out("\n-- Contact --")
-        out(f"  Name:  {contact.get('Name', '--')}")
-        out(f"  Email: {contact.get('Email', '--')}")
-        out(f"  Phone: {contact.get('Phone', '--')}")
+        out("\n## Contact")
+        out(f"- **Name:** {contact.get('Name', '--')}")
+        out(f"- **Email:** {contact.get('Email', '--')}")
+        out(f"- **Phone:** {contact.get('Phone', '--')}")
 
     # Vehicle
-    out("\n-- Vehicle --")
+    out("\n## Vehicle")
     year = _val(case, "Vehicle_Year__c")
     make = _val(case, "Vehicle_Make__c")
     model = _val(case, "Vehicle_Model__c")
-    out(f"  {year} {make} {model}")
+    out(f"{year} {make} {model}")
 
     # Product & Damage
-    out("\n-- Product & Damage --")
-    out(f"  Product:       {_val(case, 'Product__c')}")
-    out(f"  Product Group: {_val(case, 'Product_Group__c')}")
-    out(f"  Damage Type:   {_val(case, 'Damage_Type__c')}")
-    out(f"  Location:      {_val(case, 'Location__c')}")
-    out(f"  Side:          {_val(case, 'Side_of_Vehicle__c')}")
-    out(f"  Row:           {_val(case, 'Vehicle_Row__c')}")
+    out("\n## Product & Damage")
+    out(f"- **Product:** {_val(case, 'Product__c')}")
+    out(f"- **Product Group:** {_val(case, 'Product_Group__c')}")
+    out(f"- **Damage Type:** {_val(case, 'Damage_Type__c')}")
+    out(f"- **Location:** {_val(case, 'Location__c')}")
+    out(f"- **Side:** {_val(case, 'Side_of_Vehicle__c')}")
 
     # Warranty
-    out("\n-- Warranty --")
-    out(f"  Status:       {_val(case, 'Warranty_Status__c')}")
-    out(f"  Account:      {_val(case, 'Warranty_Account_Name__c')}")
-    out(f"  Group Code:   {_val(case, 'Warranty_Group_Code__c')}")
+    out("\n## Warranty")
+    warranty = case.get("Warranty__r")
+    out(f"- **Contract #:** {warranty.get('ContractNumber', '--') if warranty else '--'}")
+    out(f"- **Status:** {_val(case, 'Warranty_Status__c')}")
+    out(f"- **Account:** {_val(case, 'Warranty_Account_Name__c')}")
+    out(f"- **Group Code:** {_val(case, 'Warranty_Group_Code__c')}")
 
     # Timeline
-    out("\n-- Timeline --")
-    out(f"  Date of Loss:       {_date(case, 'Date_of_Loss__c')}")
-    out(f"  Claim Date:         {_date(case, 'Claim_Date__c')}")
-    out(f"  Created:            {_date(case, 'CreatedDate')}")
-    out(f"  Closed:             {_date(case, 'ClosedDate')}")
-    out(f"  Days Loss->Claim:   {_val(case, 'Days_from_loss_to_claim__c')}")
-    out(f"  Age:                {_val(case, 'Age__c')}")
+    out("\n## Timeline")
+    out(f"- **Date of Loss:** {_date(case, 'Date_of_Loss__c')}")
+    out(f"- **Claim Date:** {_date(case, 'Claim_Date__c')}")
+    out(f"- **Created:** {_date(case, 'CreatedDate')}")
+    out(f"- **Closed:** {_date(case, 'ClosedDate')}")
+    out(f"- **Days Loss→Claim:** {_val(case, 'Days_from_loss_to_claim__c')}")
+    out(f"- **Age:** {_val(case, 'Age__c')}")
 
     # Financials
-    out("\n-- Financials --")
-    out(f"  Estimated Cost:     {_money(case, 'Estimated_Cost__c')}")
-    out(f"    EST Parts:        {_money(case, 'EST_Parts_Cost__c')}")
-    out(f"    EST Labor:        {_money(case, 'EST_Labor_Cost__c')}")
-    out(f"    EST Labor Amt:    {_money(case, 'EST_Labor_Amount__c')}")
-    out(f"    EST Tax:          {_money(case, 'EST_Tax_Cost__c')}")
-    out(f"    EST Total:        {_money(case, 'EST_Total_Cost__c')}")
-    out(f"  ACT Parts:          {_money(case, 'ACT_Parts_Cost__c')}")
-    out(f"  ACT Labor:          {_money(case, 'ACT_Labor_Cost__c')}")
-    out(f"  ACT Labor Amt:      {_money(case, 'ACT_Labor_Amount__c')}")
-    out(f"  ACT Tax:            {_money(case, 'ACT_Tax_Cost__c')}")
-    out(f"  ACT Total:          {_money(case, 'ACT_Total_Cost__c')}")
-    out(f"  Approved Amount:    {_money(case, 'Approved_Amount__c')}")
-    out(f"  Permaplate Amount:  {_money(case, 'Permaplate_Amount__c')}")
-    out(f"  Dealer Amount:      {_money(case, 'Dealer_Amount__c')}")
-    out(f"  Sales Amount:       {_money(case, 'Sales_Amount__c')}")
-    out(f"  Invoice Total:      {_money(case, 'Invoice_Total__c')}")
-    out(f"  Posted Invoice:     {_money(case, 'Actual_Invoice_Amount__c')}")
+    out("\n## Financials")
+    out(f"- **Estimated Cost:** {_money(case, 'Estimated_Cost__c')}")
+    out(f"- **EST Total:** {_money(case, 'EST_Total_Cost__c')}")
+    out(f"- **ACT Total:** {_money(case, 'ACT_Total_Cost__c')}")
+    out(f"- **Posted Invoice:** {_money(case, 'Actual_Invoice_Amount__c')}")
 
-    # Narrative fields (raw)
-    out("\n-- Narrative --")
-    out(f"  Subject:     {_val(case, 'Subject')}")
-    out(f"  Description: {_val(case, 'Description')}")
+    # Narrative fields
+    out("\n## Narrative")
+    out(f"**Subject:** {_val(case, 'Subject')}")
+    out(f"\n**Description:** {_val(case, 'Description')}")
     summary = _val(case, "Case_Summary__c")
     if summary != "--":
         summary = summary.replace("\r\n", "\n").replace("\r", "\n")
-        summary_lines = summary.split("\n")
-        out(f"  Case Summary: {summary_lines[0]}")
-        for line in summary_lines[1:]:
-            out(f"                {line}")
+        out(f"\n**Case Summary:**\n{summary}")
     else:
-        out(f"  Case Summary: --")
+        out(f"\n**Case Summary:** --")
 
     # Comments
     comments = _get_comments(case)
     if comments:
-        out(f"\n-- Comments ({len(comments)}) --")
+        out(f"\n## Comments ({len(comments)})")
         for c in comments:
-            out(f"  {c}")
+            out(f"- {c}")
     else:
-        out("\n-- Comments: none --")
+        out("\n## Comments\nNone")
 
     # Data completeness
     flags = _check_completeness(case)
     if flags:
-        out("\n-- Data Completeness Flags --")
+        out("\n## Data Completeness Flags")
         for flag in flags:
-            out(f"  * {flag}")
+            out(f"- {flag}")
     else:
-        out("\n-- Data Completeness: all key fields populated --")
+        out("\n## Data Completeness\nAll key fields populated.")
 
     # LLM Analysis
-    out("\n-- LLM Analysis --")
+    out("\n## LLM Analysis")
     print(f"  Analyzing {case_number} with Claude...")
     try:
         analysis = analyze_narrative(case)
-        for line in analysis.split("\n"):
-            out(f"  {line}")
+        out(analysis)
     except Exception as e:
-        out(f"  Error during analysis: {e}")
-
-    out("\n" + "=" * 70)
+        out(f"*Error during analysis: {e}*")
 
     # Write to file
-    filename = f"reports/{case_number}.txt"
+    filename = f"reports/{case_number}.md"
     with open(filename, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     print(f"  Report written to {filename}")
