@@ -4,6 +4,7 @@
 import os
 from typing import Optional
 from datetime import datetime
+from pathlib import Path
 import requests
 from dotenv import load_dotenv
 import anthropic
@@ -15,10 +16,10 @@ MODEL = "claude-sonnet-4-6"
 
 CASE_FIELDS = [
     # Claim overview
-    "CaseNumber", "Status", "Type", "Priority", "Origin",
+    "CaseNumber", "Status", "Type", "Origin",
     "Claim_Determination__c", "Resolution__c", "Who_Filed_Claim__c",
     "Denial_Reason__c", "Denial_Reason_Text__c", "Claim_Number__c",
-    "Confirmation_Num__c", "Claim_Score__c", "Original_Owner_Toggle__c",
+    "Confirmation_Num__c", "Original_Owner_Toggle__c",
     # Unstructured / narrative
     "Subject", "Description", "Case_Summary__c",
     "Additional_Information__c", "Attempt_to_Rectify__c",
@@ -33,16 +34,27 @@ CASE_FIELDS = [
     "Date_of_Loss__c", "Claim_Date__c", "CreatedDate", "ClosedDate",
     "Days_from_loss_to_claim__c", "Age__c",
     # Financials
-    "Estimated_Cost__c", "EST_Total_Cost__c", "ACT_Total_Cost__c",
-    "Actual_Invoice_Amount__c",
+    "Estimated_Cost__c", "Actual_Invoice_Amount__c",
     # Related names (parent relationship queries)
     "Account.Name", "Contact.Name", "Contact.Email", "Contact.Phone",
     # Service Contract (via custom Warranty__c lookup)
-    "Warranty__c", "Warranty__r.ContractNumber",
+    "Warranty__c", "Warranty__r.Name", "Warranty__r.StartDate",
+]
+
+DAMAGE_LINE_FIELDS = [
+    "Damage_Line_Count__c", "Status__c", "Claim_Type__c", "Type_of_Damage__c",
+    "Claim_Determination__c", "Cause_of_Damage__c",
+    "Location__c", "Side_of_Vehicle__c", "Rectification_Method__c",
+    "Estimate__c", "Approved_Amount__c", "Deductible_Amount__c",
+    "Actual_Invoice_Amount__c", "Total_Invoice_Line_Amount__c",
+    "Technician_Instructions__c",
+    "Denial_Reason__c", "Denial_Reason_Text__c",
 ]
 
 CASE_QUERY = (
     "SELECT " + ", ".join(CASE_FIELDS) +
+    ", (SELECT " + ", ".join(DAMAGE_LINE_FIELDS) +
+    " FROM Rectification_Lines__r ORDER BY Damage_Line_Count__c ASC)"
     ", (SELECT Id, CommentBody, CreatedDate, CreatedBy.Name FROM CaseComments ORDER BY CreatedDate ASC)"
     " FROM Case WHERE CaseNumber = '{}'"
 )
@@ -134,6 +146,14 @@ def _get_comments(case):
     return comments
 
 
+def _get_damage_lines(case):
+    """Extract Rectification_Lines__r into a list of dicts."""
+    data = case.get("Rectification_Lines__r")
+    if not data or not data.get("records"):
+        return []
+    return data["records"]
+
+
 def _check_completeness(case):
     """Flag key fields that are empty/missing."""
     flags = []
@@ -156,15 +176,67 @@ def _check_completeness(case):
     if not case.get("Date_of_Loss__c"):
         flags.append("No Date of Loss")
 
+    if not _get_damage_lines(case):
+        flags.append("No Damage Lines")
+
     return flags
 
 
+def _build_structured_summary(case):
+    """Build a concise summary of structured fields for LLM context."""
+    parts = []
+    parts.append(f"Status: {_val(case, 'Status')}")
+    parts.append(f"Determination: {_val(case, 'Claim_Determination__c')}")
+    parts.append(f"Vehicle: {_val(case, 'Vehicle_Year__c')} {_val(case, 'Vehicle_Make__c')} {_val(case, 'Vehicle_Model__c')}")
+    parts.append(f"Product: {_val(case, 'Product__c')}")
+    parts.append(f"Date of Loss: {_val(case, 'Date_of_Loss__c')}")
+    parts.append(f"Days Loss to Claim: {_val(case, 'Days_from_loss_to_claim__c')}")
+    parts.append(f"Warranty Status: {_val(case, 'Warranty_Status__c')}")
+
+    damage_lines = _get_damage_lines(case)
+    if damage_lines:
+        parts.append(f"Damage Lines: {len(damage_lines)}")
+        for dl in damage_lines:
+            line_num = int(dl.get("Damage_Line_Count__c", 0)) if dl.get("Damage_Line_Count__c") else "?"
+            items = [f"Line {line_num}"]
+            for field, label in [
+                ("Claim_Type__c", "Claim Type"),
+                ("Type_of_Damage__c", "Damage"),
+                ("Cause_of_Damage__c", "Cause"),
+                ("Location__c", "Location"),
+                ("Side_of_Vehicle__c", "Side"),
+                ("Rectification_Method__c", "Method"),
+                ("Claim_Determination__c", "Determination"),
+            ]:
+                v = dl.get(field)
+                if v:
+                    items.append(f"{label}: {v}")
+            for field, label in [
+                ("Estimate__c", "Estimate"),
+                ("Approved_Amount__c", "Approved"),
+                ("Actual_Invoice_Amount__c", "Invoice"),
+            ]:
+                v = dl.get(field)
+                if v is not None:
+                    items.append(f"{label}: ${v:,.2f}")
+            parts.append("  " + " | ".join(items))
+    else:
+        parts.append("Damage Lines: none")
+
+    return "\n".join(parts)
+
+
 def analyze_narrative(case):
-    """Send unstructured text fields to Claude for quality analysis."""
+    """Send structured summary and narrative fields to Claude for quality analysis."""
     comments = _get_comments(case)
     comments_text = "\n".join(comments) if comments else "(none)"
+    structured = _build_structured_summary(case)
 
-    narrative = f"""Subject: {_val(case, 'Subject', '(empty)')}
+    prompt = f"""STRUCTURED DATA ON FILE:
+{structured}
+
+NARRATIVE FIELDS:
+Subject: {_val(case, 'Subject', '(empty)')}
 
 Description: {_val(case, 'Description', '(empty)')}
 
@@ -177,20 +249,13 @@ Attempt to Rectify: {_val(case, 'Attempt_to_Rectify__c', '(empty)')}
 Case Comments:
 {comments_text}"""
 
-    system_prompt = """You are a claims quality analyst reviewing vehicle service agreement claims.
-Analyze the claim narrative below for:
-1. Completeness -- are the key facts present (what happened, when, where on vehicle, damage description)?
-2. Clarity -- is the narrative clear and understandable?
-3. Red flags -- anything unusual, inconsistent, or concerning?
-4. Missing information -- what important details are absent that should be captured?
-
-Be concise and direct. Use bullet points. Focus on actionable observations."""
+    system_prompt = Path("qa_instructions.txt").read_text(encoding="utf-8")
 
     response = client.messages.create(
         model=MODEL,
         max_tokens=1024,
         system=system_prompt,
-        messages=[{"role": "user", "content": narrative}],
+        messages=[{"role": "user", "content": prompt}],
     )
     return response.content[0].text
 
@@ -211,10 +276,8 @@ def generate_report(case):
     out(f"- **Status:** {_val(case, 'Status')}")
     out(f"- **Determination:** {_val(case, 'Claim_Determination__c')}")
     out(f"- **Resolution:** {_val(case, 'Resolution__c')}")
-    out(f"- **Priority:** {_val(case, 'Priority')}")
     out(f"- **Origin:** {_val(case, 'Origin')}")
     out(f"- **Who Filed:** {_val(case, 'Who_Filed_Claim__c')}")
-    out(f"- **Claim Score:** {_val(case, 'Claim_Score__c')}")
     if case.get("Denial_Reason__c"):
         out(f"- **Denial Reason:** {case['Denial_Reason__c']}")
         if case.get("Denial_Reason_Text__c"):
@@ -246,10 +309,12 @@ def generate_report(case):
     # Warranty
     out("\n## Warranty")
     warranty = case.get("Warranty__r")
-    out(f"- **Contract #:** {warranty.get('ContractNumber', '--') if warranty else '--'}")
+    out(f"- **Contract #:** {warranty.get('Name', '--') if warranty else '--'}")
     out(f"- **Status:** {_val(case, 'Warranty_Status__c')}")
     out(f"- **Account:** {_val(case, 'Warranty_Account_Name__c')}")
     out(f"- **Group Code:** {_val(case, 'Warranty_Group_Code__c')}")
+    warranty_start = warranty.get('StartDate', '--') if warranty else '--'
+    out(f"- **Start Date:** {warranty_start}")
 
     # Timeline
     out("\n## Timeline")
@@ -263,9 +328,43 @@ def generate_report(case):
     # Financials
     out("\n## Financials")
     out(f"- **Estimated Cost:** {_money(case, 'Estimated_Cost__c')}")
-    out(f"- **EST Total:** {_money(case, 'EST_Total_Cost__c')}")
-    out(f"- **ACT Total:** {_money(case, 'ACT_Total_Cost__c')}")
     out(f"- **Posted Invoice:** {_money(case, 'Actual_Invoice_Amount__c')}")
+
+    # Damage Lines
+    damage_lines = _get_damage_lines(case)
+    if damage_lines:
+        out(f"\n## Damage Lines ({len(damage_lines)})")
+        for dl in damage_lines:
+            line_num = dl.get("Damage_Line_Count__c", "?")
+            out(f"\n### Line {int(line_num) if line_num else '?'}")
+            out(f"- **Status:** {dl.get('Status__c', '--')}")
+            out(f"- **Claim Type:** {dl.get('Claim_Type__c', '--')}")
+            out(f"- **Type of Damage:** {dl.get('Type_of_Damage__c', '--')}")
+            out(f"- **Determination:** {dl.get('Claim_Determination__c', '--')}")
+            out(f"- **Cause:** {dl.get('Cause_of_Damage__c', '--')}")
+            out(f"- **Location:** {dl.get('Location__c', '--')}")
+            out(f"- **Side:** {dl.get('Side_of_Vehicle__c', '--')}")
+            out(f"- **Method:** {dl.get('Rectification_Method__c', '--')}")
+            estimate = dl.get('Estimate__c')
+            approved = dl.get('Approved_Amount__c')
+            deductible = dl.get('Deductible_Amount__c')
+            invoice = dl.get('Actual_Invoice_Amount__c')
+            total_inv = dl.get('Total_Invoice_Line_Amount__c')
+            if any(v is not None for v in [estimate, approved, deductible, invoice, total_inv]):
+                out(f"- **Estimate:** {'${:,.2f}'.format(estimate) if estimate is not None else '--'}")
+                out(f"- **Approved:** {'${:,.2f}'.format(approved) if approved is not None else '--'}")
+                out(f"- **Deductible:** {'${:,.2f}'.format(deductible) if deductible is not None else '--'}")
+                out(f"- **Invoice:** {'${:,.2f}'.format(invoice) if invoice is not None else '--'}")
+                out(f"- **Total Invoice Line:** {'${:,.2f}'.format(total_inv) if total_inv is not None else '--'}")
+            tech = dl.get('Technician_Instructions__c')
+            if tech:
+                out(f"- **Tech Instructions:** {tech}")
+            if dl.get('Denial_Reason__c'):
+                out(f"- **Denial Reason:** {dl['Denial_Reason__c']}")
+                if dl.get('Denial_Reason_Text__c'):
+                    out(f"- **Denial Detail:** {dl['Denial_Reason_Text__c']}")
+    else:
+        out("\n## Damage Lines\nNone")
 
     # Narrative fields
     out("\n## Narrative")
