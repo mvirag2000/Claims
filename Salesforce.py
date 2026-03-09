@@ -8,6 +8,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 import anthropic
+from Contract import getContractPDF
 
 load_dotenv()
 
@@ -226,7 +227,43 @@ def _build_structured_summary(case):
     return "\n".join(parts)
 
 
-def analyze_narrative(case):
+def summarize_contract(base64_pdf):
+    """Send contract PDF to Claude and get a concise coverage summary."""
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=4096,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": base64_pdf,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Summarize this vehicle service agreement concisely. Include:\n"
+                            "- Covered components/systems\n"
+                            "- Coverage exclusions\n"
+                            "- Term and mileage limits\n"
+                            "- Deductible amount\n"
+                            "- Any notable conditions or limitations\n"
+                            "Use bullet points. Be direct."
+                        ),
+                    },
+                ],
+            }
+        ],
+    )
+    return response.content[0].text
+
+
+def analyze_narrative(case, coverage_summary=None):
     """Send structured summary and narrative fields to Claude for quality analysis."""
     comments = _get_comments(case)
     comments_text = "\n".join(comments) if comments else "(none)"
@@ -249,11 +286,17 @@ Attempt to Rectify: {_val(case, 'Attempt_to_Rectify__c', '(empty)')}
 Case Comments:
 {comments_text}"""
 
+    if coverage_summary:
+        prompt += f"""
+
+CONTRACT COVERAGE SUMMARY:
+{coverage_summary}"""
+
     system_prompt = Path("qa_instructions.txt").read_text(encoding="utf-8")
 
     response = client.messages.create(
         model=MODEL,
-        max_tokens=1024,
+        max_tokens=4096,
         system=system_prompt,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -395,11 +438,31 @@ def generate_report(case):
     else:
         out("\n## Data Completeness\nAll key fields populated.")
 
+    # Contract coverage summary
+    coverage_summary = None
+    warranty = case.get("Warranty__r")
+    contract_number = warranty.get("Name") if warranty else None
+    if contract_number:
+        print(f"  Fetching contract {contract_number} from PermaPlate...")
+        base64_pdf = getContractPDF(contract_number)
+        if base64_pdf:
+            print(f"  Summarizing contract with Claude...")
+            try:
+                coverage_summary = summarize_contract(base64_pdf)
+                out("\n## Coverage Summary")
+                out(coverage_summary)
+            except Exception as e:
+                out(f"\n## Coverage Summary\n*Error during summarization: {e}*")
+        else:
+            out(f"\n## Coverage Summary\nContract {contract_number} not found in PermaPlate.")
+    else:
+        out("\n## Coverage Summary\nNo warranty contract linked to this case.")
+
     # LLM Analysis
     out("\n## LLM Analysis")
     print(f"  Analyzing {case_number} with Claude...")
     try:
-        analysis = analyze_narrative(case)
+        analysis = analyze_narrative(case, coverage_summary)
         out(analysis)
     except Exception as e:
         out(f"*Error during analysis: {e}*")

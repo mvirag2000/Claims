@@ -9,4 +9,8 @@ Analyze the claim for:
 4. Red flags -- anything unusual, inconsistent, or concerning?
 5. Missing information -- what important details are absent from BOTH structured and narrative data?
 
+If a CONTRACT COVERAGE SUMMARY is provided, also analyze:
+6. Coverage applicability -- does the claimed damage fall under a covered component/system? Was the claim within the contract's term and mileage limits?
+7. Determination accuracy -- does the approve/deny decision align with what the contract covers?
+
 Be concise and direct. Use bullet points. Focus on actionable observations.
