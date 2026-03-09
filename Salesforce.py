@@ -40,6 +40,14 @@ CASE_FIELDS = [
     "Account.Name", "Contact.Name", "Contact.Email", "Contact.Phone",
     # Service Contract (via custom Warranty__c lookup)
     "Warranty__c", "Warranty__r.Name", "Warranty__r.StartDate",
+    "Warranty__r.EndDate", "Warranty__r.Term",
+    "Warranty__r.New_Used__c",
+    "Warranty__r.Aggregate_Windshield__c",
+    "Warranty__r.Aggregate_Paintguard__c",
+    "Warranty__r.Aggregate_Leatherguard__c",
+    "Warranty__r.Aggregate_Fiberguard__c",
+    "Warranty__r.Aggregate_Rental_Car__c",
+    "Warranty__r.Aggregate_Vinyl_Awning__c",
 ]
 
 DAMAGE_LINE_FIELDS = [
@@ -100,6 +108,32 @@ def get_case(access_token, instance_url, case_number):
     if data["totalSize"] == 0:
         return None
     return data["records"][0]
+
+
+LINE_ITEM_FIELDS = [
+    "LineItemNumber", "ProductName__c", "Description",
+    "Repair__c", "StartDate", "EndDate", "Status",
+]
+
+LINE_ITEM_QUERY = (
+    "SELECT " + ", ".join(LINE_ITEM_FIELDS) +
+    " FROM ContractLineItem WHERE ServiceContractId = '{}'"
+    " ORDER BY LineItemNumber ASC"
+)
+
+
+def get_line_items(access_token, instance_url, service_contract_id):
+    """Fetch ContractLineItems for a ServiceContract."""
+    query = LINE_ITEM_QUERY.format(service_contract_id)
+    response = requests.get(
+        f"{instance_url}/services/data/v62.0/query",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"q": query},
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data["records"] if data["totalSize"] > 0 else []
 
 
 def _val(case, field, default="--"):
@@ -183,7 +217,7 @@ def _check_completeness(case):
     return flags
 
 
-def _build_structured_summary(case):
+def _build_structured_summary(case, line_items=None):
     """Build a concise summary of structured fields for LLM context."""
     parts = []
     parts.append(f"Status: {_val(case, 'Status')}")
@@ -193,6 +227,35 @@ def _build_structured_summary(case):
     parts.append(f"Date of Loss: {_val(case, 'Date_of_Loss__c')}")
     parts.append(f"Days Loss to Claim: {_val(case, 'Days_from_loss_to_claim__c')}")
     parts.append(f"Warranty Status: {_val(case, 'Warranty_Status__c')}")
+
+    # Warranty detail from ServiceContract
+    warranty = case.get("Warranty__r")
+    if warranty:
+        parts.append(f"Warranty: {warranty.get('Name', '--')} | Start: {warranty.get('StartDate', '--')} | End: {warranty.get('EndDate', '--')} | Term: {warranty.get('Term', '--')} | New/Used: {warranty.get('New_Used__c', '--')}")
+        agg_fields = [
+            ("Aggregate_Windshield__c", "Windshield"),
+            ("Aggregate_Paintguard__c", "Paintguard"),
+            ("Aggregate_Leatherguard__c", "Leatherguard"),
+            ("Aggregate_Fiberguard__c", "Fiberguard"),
+            ("Aggregate_Rental_Car__c", "Rental Car"),
+            ("Aggregate_Vinyl_Awning__c", "Vinyl/Awning"),
+        ]
+        aggs = [f"{label}: ${warranty[f]:,.2f}" for f, label in agg_fields if warranty.get(f) is not None]
+        if aggs:
+            parts.append(f"Aggregate Limits: {' | '.join(aggs)}")
+
+    # Warranty line items
+    if line_items:
+        parts.append(f"Warranty Line Items: {len(line_items)}")
+        for li in line_items:
+            items = [li.get('ProductName__c', '?')]
+            if li.get('Repair__c'):
+                items.append("Repair: Yes")
+            if li.get('Status'):
+                items.append(f"Status: {li['Status']}")
+            if li.get('EndDate'):
+                items.append(f"Ends: {li['EndDate']}")
+            parts.append("  " + " | ".join(items))
 
     damage_lines = _get_damage_lines(case)
     if damage_lines:
@@ -263,11 +326,11 @@ def summarize_contract(base64_pdf):
     return response.content[0].text
 
 
-def analyze_narrative(case, coverage_summary=None):
+def analyze_narrative(case, coverage_summary=None, line_items=None):
     """Send structured summary and narrative fields to Claude for quality analysis."""
     comments = _get_comments(case)
     comments_text = "\n".join(comments) if comments else "(none)"
-    structured = _build_structured_summary(case)
+    structured = _build_structured_summary(case, line_items)
 
     prompt = f"""STRUCTURED DATA ON FILE:
 {structured}
@@ -303,8 +366,10 @@ CONTRACT COVERAGE SUMMARY:
     return response.content[0].text
 
 
-def generate_report(case):
+def generate_report(case, line_items=None):
     """Build a structured quality report for a case and write to file."""
+    if line_items is None:
+        line_items = []
     case_number = case["CaseNumber"]
     lines = []
 
@@ -317,14 +382,7 @@ def generate_report(case):
     out("\n## Claim Overview")
     out(f"- **Case Number:** {_val(case, 'CaseNumber')}")
     out(f"- **Status:** {_val(case, 'Status')}")
-    out(f"- **Determination:** {_val(case, 'Claim_Determination__c')}")
-    out(f"- **Resolution:** {_val(case, 'Resolution__c')}")
-    out(f"- **Origin:** {_val(case, 'Origin')}")
     out(f"- **Who Filed:** {_val(case, 'Who_Filed_Claim__c')}")
-    if case.get("Denial_Reason__c"):
-        out(f"- **Denial Reason:** {case['Denial_Reason__c']}")
-        if case.get("Denial_Reason_Text__c"):
-            out(f"- **Denial Detail:** {case['Denial_Reason_Text__c']}")
 
     # Contact
     contact = case.get("Contact")
@@ -336,28 +394,33 @@ def generate_report(case):
 
     # Vehicle
     out("\n## Vehicle")
-    year = _val(case, "Vehicle_Year__c")
-    make = _val(case, "Vehicle_Make__c")
-    model = _val(case, "Vehicle_Model__c")
-    out(f"{year} {make} {model}")
+    out(f"- **Make:** {_val(case, 'Vehicle_Make__c')}")
+    out(f"- **Model:** {_val(case, 'Vehicle_Model__c')}")
+    out(f"- **Year:** {_val(case, 'Vehicle_Year__c')}")
 
-    # Product & Damage
-    out("\n## Product & Damage")
-    out(f"- **Product:** {_val(case, 'Product__c')}")
-    out(f"- **Product Group:** {_val(case, 'Product_Group__c')}")
-    out(f"- **Damage Type:** {_val(case, 'Damage_Type__c')}")
-    out(f"- **Location:** {_val(case, 'Location__c')}")
-    out(f"- **Side:** {_val(case, 'Side_of_Vehicle__c')}")
-
-    # Warranty
-    out("\n## Warranty")
-    warranty = case.get("Warranty__r")
-    out(f"- **Contract #:** {warranty.get('Name', '--') if warranty else '--'}")
-    out(f"- **Status:** {_val(case, 'Warranty_Status__c')}")
-    out(f"- **Account:** {_val(case, 'Warranty_Account_Name__c')}")
-    out(f"- **Group Code:** {_val(case, 'Warranty_Group_Code__c')}")
-    warranty_start = warranty.get('StartDate', '--') if warranty else '--'
-    out(f"- **Start Date:** {warranty_start}")
+    # Damage Lines (includes product & damage detail per Jordan's layout)
+    damage_lines = _get_damage_lines(case)
+    if damage_lines:
+        out(f"\n## Damage Lines ({len(damage_lines)})")
+        for dl in damage_lines:
+            line_num = dl.get("Damage_Line_Count__c", "?")
+            out(f"\n### Line {int(line_num) if line_num else '?'}")
+            out(f"- **Type of Damage:** {dl.get('Type_of_Damage__c', '--')}")
+            out(f"- **Determination:** {dl.get('Claim_Determination__c', '--')}")
+            if dl.get('Denial_Reason__c'):
+                out(f"- **Denial Reason:** {dl['Denial_Reason__c']}")
+                if dl.get('Denial_Reason_Text__c'):
+                    out(f"- **Denial Detail:** {dl['Denial_Reason_Text__c']}")
+            out(f"- **Rectification Method:** {dl.get('Rectification_Method__c', '--')}")
+            approved = dl.get('Approved_Amount__c')
+            invoice = dl.get('Actual_Invoice_Amount__c')
+            out(f"- **Approved Amount:** {'${:,.2f}'.format(approved) if approved is not None else '--'}")
+            out(f"- **Posted Invoice:** {'${:,.2f}'.format(invoice) if invoice is not None else '--'}")
+            tech = dl.get('Technician_Instructions__c')
+            if tech:
+                out(f"- **Technician Instructions:** {tech}")
+    else:
+        out("\n## Damage Lines\nNone")
 
     # Timeline
     out("\n## Timeline")
@@ -365,69 +428,24 @@ def generate_report(case):
     out(f"- **Claim Date:** {_date(case, 'Claim_Date__c')}")
     out(f"- **Created:** {_date(case, 'CreatedDate')}")
     out(f"- **Closed:** {_date(case, 'ClosedDate')}")
-    out(f"- **Days Loss→Claim:** {_val(case, 'Days_from_loss_to_claim__c')}")
-    out(f"- **Age:** {_val(case, 'Age__c')}")
 
-    # Financials
+    # Financials (case-level totals)
     out("\n## Financials")
-    out(f"- **Estimated Cost:** {_money(case, 'Estimated_Cost__c')}")
+    # Sum approved from damage lines since there's no case-level Approved_Amount__c
+    total_approved = sum(
+        dl.get('Approved_Amount__c', 0) or 0 for dl in damage_lines
+    )
+    out(f"- **Total Approved:** {'${:,.2f}'.format(total_approved) if damage_lines else '--'}")
     out(f"- **Posted Invoice:** {_money(case, 'Actual_Invoice_Amount__c')}")
 
-    # Damage Lines
-    damage_lines = _get_damage_lines(case)
-    if damage_lines:
-        out(f"\n## Damage Lines ({len(damage_lines)})")
-        for dl in damage_lines:
-            line_num = dl.get("Damage_Line_Count__c", "?")
-            out(f"\n### Line {int(line_num) if line_num else '?'}")
-            out(f"- **Status:** {dl.get('Status__c', '--')}")
-            out(f"- **Claim Type:** {dl.get('Claim_Type__c', '--')}")
-            out(f"- **Type of Damage:** {dl.get('Type_of_Damage__c', '--')}")
-            out(f"- **Determination:** {dl.get('Claim_Determination__c', '--')}")
-            out(f"- **Cause:** {dl.get('Cause_of_Damage__c', '--')}")
-            out(f"- **Location:** {dl.get('Location__c', '--')}")
-            out(f"- **Side:** {dl.get('Side_of_Vehicle__c', '--')}")
-            out(f"- **Method:** {dl.get('Rectification_Method__c', '--')}")
-            estimate = dl.get('Estimate__c')
-            approved = dl.get('Approved_Amount__c')
-            deductible = dl.get('Deductible_Amount__c')
-            invoice = dl.get('Actual_Invoice_Amount__c')
-            total_inv = dl.get('Total_Invoice_Line_Amount__c')
-            if any(v is not None for v in [estimate, approved, deductible, invoice, total_inv]):
-                out(f"- **Estimate:** {'${:,.2f}'.format(estimate) if estimate is not None else '--'}")
-                out(f"- **Approved:** {'${:,.2f}'.format(approved) if approved is not None else '--'}")
-                out(f"- **Deductible:** {'${:,.2f}'.format(deductible) if deductible is not None else '--'}")
-                out(f"- **Invoice:** {'${:,.2f}'.format(invoice) if invoice is not None else '--'}")
-                out(f"- **Total Invoice Line:** {'${:,.2f}'.format(total_inv) if total_inv is not None else '--'}")
-            tech = dl.get('Technician_Instructions__c')
-            if tech:
-                out(f"- **Tech Instructions:** {tech}")
-            if dl.get('Denial_Reason__c'):
-                out(f"- **Denial Reason:** {dl['Denial_Reason__c']}")
-                if dl.get('Denial_Reason_Text__c'):
-                    out(f"- **Denial Detail:** {dl['Denial_Reason_Text__c']}")
-    else:
-        out("\n## Damage Lines\nNone")
-
-    # Narrative fields
+    # Narrative
     out("\n## Narrative")
-    out(f"**Subject:** {_val(case, 'Subject')}")
-    out(f"\n**Description:** {_val(case, 'Description')}")
     summary = _val(case, "Case_Summary__c")
     if summary != "--":
         summary = summary.replace("\r\n", "\n").replace("\r", "\n")
-        out(f"\n**Case Summary:**\n{summary}")
+        out(f"**Case Summary:**\n{summary}")
     else:
-        out(f"\n**Case Summary:** --")
-
-    # Comments
-    comments = _get_comments(case)
-    if comments:
-        out(f"\n## Comments ({len(comments)})")
-        for c in comments:
-            out(f"- {c}")
-    else:
-        out("\n## Comments\nNone")
+        out(f"**Case Summary:** --")
 
     # Data completeness
     flags = _check_completeness(case)
@@ -438,7 +456,7 @@ def generate_report(case):
     else:
         out("\n## Data Completeness\nAll key fields populated.")
 
-    # Contract coverage summary
+    # Contract coverage summary (fed to LLM, not shown in report)
     coverage_summary = None
     warranty = case.get("Warranty__r")
     contract_number = warranty.get("Name") if warranty else None
@@ -449,20 +467,16 @@ def generate_report(case):
             print(f"  Summarizing contract with Claude...")
             try:
                 coverage_summary = summarize_contract(base64_pdf)
-                out("\n## Coverage Summary")
-                out(coverage_summary)
             except Exception as e:
-                out(f"\n## Coverage Summary\n*Error during summarization: {e}*")
+                print(f"  Error summarizing contract: {e}")
         else:
-            out(f"\n## Coverage Summary\nContract {contract_number} not found in PermaPlate.")
-    else:
-        out("\n## Coverage Summary\nNo warranty contract linked to this case.")
+            print(f"  Contract {contract_number} not found in PermaPlate.")
 
     # LLM Analysis
     out("\n## LLM Analysis")
     print(f"  Analyzing {case_number} with Claude...")
     try:
-        analysis = analyze_narrative(case, coverage_summary)
+        analysis = analyze_narrative(case, coverage_summary, line_items)
         out(analysis)
     except Exception as e:
         out(f"*Error during analysis: {e}*")
@@ -484,7 +498,11 @@ def main():
     while case_number != "":
         case = get_case(access_token, instance_url, case_number)
         if case:
-            generate_report(case)
+            line_items = []
+            warranty_id = case.get("Warranty__c")
+            if warranty_id:
+                line_items = get_line_items(access_token, instance_url, warranty_id)
+            generate_report(case, line_items)
         else:
             print(f"Case {case_number} not found.\n")
         case_number = input("Enter case number: ")
