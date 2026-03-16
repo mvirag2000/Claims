@@ -5,3 +5,7 @@ case-numbers.txt
 reports/
 *.json
 case_describe.txt
+User Input/
+case_summary/
+contract_summary/
+qa_instructions_v1.txt
