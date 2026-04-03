@@ -10,6 +10,74 @@ from sf_shared import (
     client, MODEL,
 )
 
+_PRODUCT_ALIASES = {
+    "ws": "Windshield", "app": "Appearance", "tw": "Tire and Wheel",
+    "pdr": "Paintless Dent Repair", "key": "Key",
+    "windshield": "Windshield", "appearance": "Appearance",
+    "tire and wheel": "Tire and Wheel", "paintless dent repair": "Paintless Dent Repair",
+}
+_PRODUCT_QUESTIONS = None
+
+
+def _load_product_questions():
+    """Parse Product_Specific.md into {heading: [questions]}, cached."""
+    global _PRODUCT_QUESTIONS
+    if _PRODUCT_QUESTIONS is not None:
+        return _PRODUCT_QUESTIONS
+    path = Path("User Input/Product_Specific.md")
+    if not path.exists():
+        _PRODUCT_QUESTIONS = {}
+        return _PRODUCT_QUESTIONS
+    questions: dict[str, list[str]] = {}
+    current = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if s.startswith("## "):
+            current = s[3:].strip()
+            questions[current] = []
+        elif s.startswith("- ") and current:
+            questions[current].append(s[2:].strip())
+    _PRODUCT_QUESTIONS = questions
+    return _PRODUCT_QUESTIONS
+
+
+def _get_product_questions_block(case):
+    """Return a formatted product-specific questions block for the system prompt, or None."""
+    qmap = _load_product_questions()
+    if not qmap:
+        return None
+
+    signals = [case.get("Product_Group__c"), case.get("Product__c")]
+    damage_data = case.get("Rectification_Lines__r")
+    if damage_data and damage_data.get("records"):
+        for dl in damage_data["records"]:
+            signals += [dl.get("Claim_Type__c"), dl.get("Type_of_Damage__c")]
+
+    matched: dict[str, list[str]] = {}
+    for val in signals:
+        if not val:
+            continue
+        lower = val.strip().lower()
+        heading = _PRODUCT_ALIASES.get(lower)
+        if heading is None:
+            for h in qmap:
+                if lower in h.lower() or h.lower() in lower:
+                    heading = h
+                    break
+        if heading and heading in qmap and heading not in matched:
+            matched[heading] = qmap[heading]
+
+    if not matched:
+        return None
+
+    lines = ["PRODUCT-SPECIFIC ASSESSMENT QUESTIONS:"]
+    for heading, qs in matched.items():
+        lines.append(f"{heading}:")
+        for q in qs:
+            lines.append(f"  - {q}")
+    return "\n".join(lines)
+
+
 LINE_ITEM_FIELDS = [
     "LineItemNumber", "ProductName__c", "Description",
     "Repair__c", "StartDate", "EndDate", "Status",
@@ -183,6 +251,15 @@ CONTRACT COVERAGE SUMMARY:
 {coverage_summary}"""
 
     system_prompt = Path("qa_instructions.txt").read_text(encoding="utf-8")
+    questions_block = _get_product_questions_block(case)
+    if questions_block:
+        system_prompt += (
+            "\n\n## Product-Specific Questions\n"
+            "For this case, verify the following as required checkpoints under \"Valid Claim.\""
+            " State whether each is answered in the narrative/structured data, summarize the"
+            " answer if found, or flag it as missing.\n\n"
+            + questions_block
+        )
 
     response = client.messages.create(
         model=MODEL,
