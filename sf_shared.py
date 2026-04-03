@@ -82,13 +82,12 @@ def get_access_token(use_test=True):
             "client_secret": os.environ["SF_TEST_CLIENT_SECRET"],
         }
     else:
-        token_url = "https://login.salesforce.com/services/oauth2/token"
+        token_url = os.environ.get("SF_TOKEN_ENDPOINT",
+                                     "https://permaplate.my.salesforce.com/services/oauth2/token")
         data = {
-            "grant_type": "password",
+            "grant_type": "client_credentials",
             "client_id": os.environ["SF_CLIENT_ID"],
             "client_secret": os.environ["SF_CLIENT_SECRET"],
-            "username": os.environ["SF_USERNAME"],
-            "password": os.environ["SF_PASSWORD"],
         }
 
     response = requests.post(token_url, data=data, timeout=15)
